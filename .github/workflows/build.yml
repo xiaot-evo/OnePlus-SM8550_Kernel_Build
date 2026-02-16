@@ -49,6 +49,8 @@ jobs:
   sm8550_kernel_build:
     runs-on: ubuntu-latest
     env:
+      LLVM: 1
+      LLVM_IAS: 1
 
     steps:
       - uses: actions/checkout@v4
