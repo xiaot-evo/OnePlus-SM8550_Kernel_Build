@@ -8,8 +8,8 @@ on:
         required: true
         type: choice
         options:
-          - LineageOS
           - crdroidandroid
+          - LineageOS
           - OnePlus12R-development
       kernel_branch:
         description: 内核源码分支
@@ -17,64 +17,263 @@ on:
         type: string
         default: ""
       ksu_type:
-        description: "KSU管理器"
+        description: KSU管理器
         required: true
         type: choice
         options:
           - None
-          - KernelSU Next
+          - KernelSU-Next
           - KowSU
           - ReSukiSU
+          - ReSukiSU-Manual
       susfs:
-        description: "启用SUSFS"
+        description: 启用SUSFS
         required: true
         type: boolean
-        default: false
-      tmpfs:
-        description: "启用TMPFS"
+        default: true
+      anykernel3:
+        description: 打包AnyKernel3
         required: true
         type: boolean
-        default: false
-      re_kernel:
-        description: "启用Re:Kernel"
-        required: true
-        type: boolean
-        default: false
-      bbg:
-        description: "启用BBG"
-        required: true
-        type: boolean
-        default: false
+        default: true
+
+env:
+  LLVM: 1
+  LLVM_IAS: 1
+  USE_CCACHE: 1
+  CCACHE_COMPRESS: 1
+  CCACHE_COMPRESSLEVEL: 5
+  CCACHE_SLOPPINESS: time_macros
+
 jobs:
-  sm8550_kernel_build:
+  build:
     runs-on: ubuntu-latest
-    env:
-      LLVM: 1
-      LLVM_IAS: 1
+    timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: awalsh128/cache-apt-pkgs-action@latest
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get build info
+        id: build-info
+        run: |
+          echo "build_date=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+          echo "runner=$(hostname)" >> $GITHUB_OUTPUT
+          echo "::notice::Build started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3
-          execute_install_scripts: true
+          path: ~/.ccache
+          key: cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-${{ inputs.ksu_type }}-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: |
+            cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-${{ inputs.ksu_type }}-
+            cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-
+            cckernel-${{ inputs.kernel_source }}-
+
+      - name: Install build dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3 git ccache patch unzip
+          version: 1.0
+
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "21.0"
+
+      - name: Setup ccache
+        run: |
+          ccache -M 50G
+          ccache -z
+          echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
+          echo "CC=ccache clang" >> $GITHUB_ENV
+          echo "CXX=ccache clang++" >> $GITHUB_ENV
+
       - name: Clone Kernel Source
         run: |
-          git clone --depth=1 -b ${{ inputs.kernel_branch }} https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git sm8550
-          git clone --depth=1 -b ${{ inputs.kernel_branch }} https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550-modules.git sm8550-modules
-      - name: Kernel Config
+          echo "::group::Clone kernel source"
+          mkdir -p sm8550 sm8550-modules
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git" sm8550
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550-modules.git" sm8550-modules
+
+          cd sm8550
+          echo "Kernel commit: $(git log -1 --oneline)"
+          echo "Kernel branch: $(git branch --show-current)"
+          echo "::endgroup::"
+
+      - name: Install KernelSU
+        if: inputs.ksu_type != 'None'
         run: |
+          echo "::group::Install KernelSU: ${{ inputs.ksu_type }}"
+          cd sm8550
+          case "${{ inputs.ksu_type }}" in
+            KernelSU-Next)
+              curl -LSs https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/dev_susfs/kernel/setup.sh | bash -s dev_susfs
+              ;;
+            KowSU)
+              curl -LSs https://raw.githubusercontent.com/KOWX712/KernelSU/main/kernel/setup.sh | bash -s master
+              ;;
+            ReSukiSU)
+              curl -LSs https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh | bash -s main
+              ;;
+            ReSukiSU-Manual)
+              curl -LSs https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh | bash -s main
+              if [ -f "${{ github.workspace }}/patches/resksu_manual_hooks.patch" ]; then
+                cp "${{ github.workspace }}/patches/resksu_manual_hooks.patch" ./
+                patch -p1 < resksu_manual_hooks.patch || echo "::warning::Patch apply failed"
+              else
+                echo "::warning::resksu_manual_hooks.patch not found"
+              fi
+              ;;
+          esac
+          echo "::endgroup::"
+
+      - name: Install SUSFS
+        if: inputs.susfs
+        run: |
+          echo "::group::Install SUSFS"
+          cd sm8550
+          git clone --depth=1 -b gki-android13-5.15 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          cp susfs/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch ./
+          cp susfs/kernel_patches/fs/* fs/
+          cp susfs/kernel_patches/include/linux/* include/linux/
+          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch || echo "::warning::SUSFS patch may already applied"
+          touch .scmversion
+          rm -rf susfs
+          echo "::endgroup::"
+
+      - name: Configure Kernel
+        run: |
+          echo "::group::Configure kernel"
+          cd sm8550
+
+          printf 'CONFIG_KSU=y\nCONFIG_TMPFS_XATTR=y\nCONFIG_TMPFS_POSIX_ACL=y\n' >> arch/arm64/configs/gki_defconfig
+
+          if [ "${{ inputs.susfs }}" = "true" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/gki_defconfig
+          fi
+
+          if [ "${{ inputs.ksu_type }}" = "ReSukiSU-Manual" ]; then
+            printf 'CONFIG_KSU_MANUAL_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y\n' >> arch/arm64/configs/gki_defconfig
+          fi
+
+          echo "Added config options:"
+          grep -E "CONFIG_KSU|CONFIG_TMPFS" arch/arm64/configs/gki_defconfig
+          echo "::endgroup::"
+
+      - name: Build Kernel Defconfig
+        run: |
+          echo "::group::Build defconfig"
           cd sm8550
           make ARCH=arm64 O=out \
               gki_defconfig \
               vendor/kalama_GKI.config \
               vendor/oplus/kalama_GKI.config \
               vendor/debugfs.config
+          echo "::endgroup::"
 
-      - name: Build Kernel
+      - name: Build Kernel Image
         run: |
-          make -j"$(nproc)" ARCH=arm64 O=out Image
+          echo "::group::Build kernel image"
+          echo "Starting at $(date)"
+          cd sm8550
+          make -j$(nproc) ARCH=arm64 O=out Image 2>&1 | tee build.log
+          echo "Finished at $(date)"
+          echo "::endgroup::"
+
+      - name: Check build output
+        run: |
+          echo "::group::Verify build output"
+          if [ -f sm8550/out/arch/arm64/boot/Image ]; then
+            echo "::notice::Build successful!"
+            ls -lh sm8550/out/arch/arm64/boot/Image
+            echo "Image size: $(stat -c%s sm8550/out/arch/arm64/boot/Image) bytes"
+          else
+            echo "::error::Build failed: Image not found"
+            if [ -f sm8550/build.log ]; then
+              echo "Last 50 lines of build.log:"
+              tail -50 sm8550/build.log
+            fi
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Package AnyKernel3
+        if: inputs.anykernel3
+        run: |
+          echo "::group::Package AnyKernel3"
+          cd ${{ github.workspace }}
+
+          if [ ! -d "AnyKernel3" ]; then
+            git clone https://github.com/osm0sis/AnyKernel3.git
+          fi
+
+          cp sm8550/out/arch/arm64/boot/Image AnyKernel3/
+
+          KSU_SUFFIX=""
+          if [ "${{ inputs.ksu_type }}" != "None" ]; then
+            KSU_SUFFIX="-${{{ inputs.ksu_type }}}"
+          fi
+
+          if [ "${{ inputs.susfs }}" = "true" ]; then
+            KSU_SUFFIX="${KSU_SUFFIX}-SUSFS"
+          fi
+
+          ZIPNAME="AnyKernel3-sm8550${KSU_SUFFIX}-$(date +%Y%m%d).zip"
+
+          cd AnyKernel3
+          zip -r9 ../${ZIPNAME} ./
+
+          mkdir -p ../out
+          mv ../${ZIPNAME} ../out/
+
+          echo "::notice::Package created: out/${ZIPNAME}"
+          ls -lh ../out/${ZIPNAME}
+          echo "::endgroup::"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}
+          path: |
+            sm8550/out/arch/arm64/boot/Image
+            out/*.zip
+            sm8550/build.log
+          retention-days: 7
+
+      - name: Show ccache stats
+        run: |
+          echo "::group::ccache stats"
+          ccache -s
+          echo "::endgroup::"
+
+      - name: Build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Kernel Source | ${{ inputs.kernel_source }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ inputs.kernel_branch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| KSU Type | ${{ inputs.ksu_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SUSFS | ${{ inputs.susfs }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| AnyKernel3 | ${{ inputs.anykernel3 }} |" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f sm8550/out/arch/arm64/boot/Image ]; then
+            echo "| Image Size | $(du -h sm8550/out/arch/arm64/boot/Image | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -f out/*.zip ]; then
+            echo "| Package | $(ls out/*.zip) |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "| Build Time | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "::group::Cleanup"
+          rm -rf sm8550-modules
+          rm -rf AnyKernel3
+          df -h /workspace 2>/dev/null || true
+          echo "::endgroup::"
