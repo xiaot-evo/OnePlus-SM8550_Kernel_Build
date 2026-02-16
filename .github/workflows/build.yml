@@ -1,0 +1,78 @@
+name: Build Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        description: 内核源码
+        required: true
+        type: choice
+        options:
+          - LineageOS
+          - crdroidandroid
+          - OnePlus12R-development
+      kernel_branch:
+        description: 内核源码分支
+        required: false
+        type: string
+        default: ""
+      ksu_type:
+        description: "KSU管理器"
+        required: true
+        type: choice
+        options:
+          - None
+          - KernelSU Next
+          - KowSU
+          - ReSukiSU
+      susfs:
+        description: "启用SUSFS"
+        required: true
+        type: boolean
+        default: false
+      tmpfs:
+        description: "启用TMPFS"
+        required: true
+        type: boolean
+        default: false
+      re_kernel:
+        description: "启用Re:Kernel"
+        required: true
+        type: boolean
+        default: false
+      bbg:
+        description: "启用BBG"
+        required: true
+        type: boolean
+        default: false
+jobs:
+  sm8550_kernel_build:
+    runs-on: ubuntu-latest
+    env:
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3
+          execute_install_scripts: true
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "21.0"
+      - name: Clone Kernel Source
+        run: |
+          git clone --depth=1 -b ${{ inputs.kernel_branch }} https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git sm8550
+          git clone --depth=1 -b ${{ inputs.kernel_branch }} https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550-modules.git sm8550-modules
+      - name: Kernel Config
+        run: |
+          cd sm8550
+          make ARCH=arm64 O=out \
+              gki_defconfig \
+              vendor/kalama_GKI.config \
+              vendor/oplus/kalama_GKI.config \
+              vendor/debugfs.config
+
+      - name: Build Kernel
+        run: |
+          make -j"$(nproc)" ARCH=arm64 O=out Image
