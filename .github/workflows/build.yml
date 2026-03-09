@@ -77,10 +77,10 @@ jobs:
           packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3 git ccache patch unzip
           version: 1.0
 
-      - name: Install LLVM and Clang
-        uses: KyleMayes/install-llvm-action@v2
+      - name: Setup LLVM
+        uses: ZhongRuoyu/setup-llvm@v0
         with:
-          version: "21.0"
+          llvm-version: "21.0"
 
       - name: Setup ccache
         run: |
