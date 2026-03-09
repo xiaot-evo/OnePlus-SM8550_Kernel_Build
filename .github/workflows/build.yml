@@ -213,7 +213,7 @@ jobs:
 
           KSU_SUFFIX=""
           if [ "${{ inputs.ksu_type }}" != "None" ]; then
-            KSU_SUFFIX="-${{{ inputs.ksu_type }}}"
+            KSU_SUFFIX="-${{ inputs.ksu_type }}"
           fi
 
           if [ "${{ inputs.susfs }}" = "true" ]; then
@@ -263,7 +263,7 @@ jobs:
             echo "| Image Size | $(du -h sm8550/out/arch/arm64/boot/Image | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if [ -f out/*.zip ]; then
+          if ls out/*.zip 1> /dev/null 2>&1; then
             echo "| Package | $(ls out/*.zip) |" >> $GITHUB_STEP_SUMMARY
           fi
 
