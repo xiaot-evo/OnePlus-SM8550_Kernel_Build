@@ -35,10 +35,9 @@ on:
 env:
   LLVM: 1
   LLVM_IAS: 1
-  USE_CCACHE: 1
-  CCACHE_COMPRESS: 1
-  CCACHE_COMPRESSLEVEL: 5
-  CCACHE_SLOPPINESS: time_macros
+  USE_SCCACHE: 1
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_STAT_SIZE: 1000000
 
 jobs:
   build:
@@ -46,6 +45,13 @@ jobs:
     timeout-minutes: 180
 
     steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 1024
+          swap-size-mb: 16384
+          remove-dotnet: "true"
+
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -55,21 +61,6 @@ jobs:
           echo "build_date=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
           echo "runner=$(hostname)" >> $GITHUB_OUTPUT
           echo "::notice::Build started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-
-      - name: Cache ccache
-        uses: actions/cache@v5
-        with:
-          path: ~/.ccache
-          key: cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-${{ inputs.ksu_type }}-${{ hashFiles('.github/workflows/build.yml') }}
-          restore-keys: |
-            cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-${{ inputs.ksu_type }}-
-            cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-
-            cckernel-${{ inputs.kernel_source }}-
-
-      - name: Set Swap Space
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 16
 
       - name: Install build dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
@@ -82,20 +73,39 @@ jobs:
         with:
           version: "21.1"
 
-      - name: Setup ccache
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
         run: |
-          ccache -M 50G
-          ccache -z
-          echo "CCACHE_EXEC=$(which ccache)" >> $GITHUB_ENV
-          echo "CC=ccache clang" >> $GITHUB_ENV
-          echo "CXX=ccache clang++" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "SCCACHE_STAT_SIZE=1000000" >> $GITHUB_ENV
+          echo "SCCACHE_WRAPPER_START_DELAY=3" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+          echo "SCCACHE=1" >> $GITHUB_ENV
+
+      - name: Cache Git References
+        uses: actions/cache@v5
+        with:
+          path: ~/.kernel-refs
+          key: kernel-refs-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}
+          restore-keys: |
+            kernel-refs-${{ inputs.kernel_source }}-
 
       - name: Clone Kernel Source
         run: |
           echo "::group::Clone kernel source"
           mkdir -p sm8550 sm8550-modules
-          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git" sm8550
-          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550-modules.git" sm8550-modules
+          mkdir -p ~/.kernel-refs/${{ inputs.kernel_source }}
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            --reference ~/.kernel-refs/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550 \
+            --dissociate \
+            "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git" sm8550 || \
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git" sm8550
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550-modules.git" sm8550-modules
 
           cd sm8550
           echo "Kernel commit: $(git log -1 --oneline)"
@@ -143,6 +153,22 @@ jobs:
           rm -rf susfs
           echo "::endgroup::"
 
+      - name: Get Kernel Commit
+        id: kernel-commit
+        run: |
+          echo "hash=$(cd sm8550 && git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "date=$(cd sm8550 && git log -1 --format='%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: Cache Build Output
+        uses: actions/cache@v5
+        with:
+          path: sm8550/out
+          key: kernel-out-${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}-${{ steps.kernel-commit.outputs.hash }}
+          restore-keys: |
+            kernel-out-${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}-
+            kernel-out-${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-
+            kernel-out-${{ inputs.kernel_source }}-
+
       - name: Configure Kernel
         run: |
           echo "::group::Configure kernel"
@@ -166,7 +192,7 @@ jobs:
         run: |
           echo "::group::Build defconfig"
           cd sm8550
-          make ARCH=arm64 O=out \
+          make SCCACHE=1 ARCH=arm64 O=out \
               gki_defconfig \
               vendor/kalama_GKI.config \
               vendor/oplus/kalama_GKI.config \
@@ -178,7 +204,7 @@ jobs:
           echo "::group::Build kernel image"
           echo "Starting at $(date)"
           cd sm8550
-          make -j$(nproc) ARCH=arm64 O=out Image 2>&1 | tee build.log
+          make -j$(nproc) SCCACHE=1 ARCH=arm64 O=out Image 2>&1 | tee build.log
           echo "Finished at $(date)"
           echo "::endgroup::"
 
@@ -205,8 +231,8 @@ jobs:
           git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git
           # Copy Image from normal build locations
-          if [ -f "$GITHUB_WORKSPACE/kernel/out/arch/arm64/Image" ]; then
-            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/Image" "$GITHUB_WORKSPACE/AnyKernel3/Image"
+          if [ -f "$GITHUB_WORKSPACE/sm8550/out/arch/arm64/boot/Image" ]; then
+            cp "$GITHUB_WORKSPACE/sm8550/out/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/AnyKernel3/Image"
           else
             echo "Error: Image file not found in any expected location"
             exit 1
@@ -221,10 +247,10 @@ jobs:
           if-no-files-found: ignore
           compression-level: 9
 
-      - name: Show ccache stats
+      - name: Show sccache stats
         run: |
-          echo "::group::ccache stats"
-          ccache -s
+          echo "::group::sccache stats"
+          sccache --show-stats
           echo "::endgroup::"
 
       - name: Build summary
