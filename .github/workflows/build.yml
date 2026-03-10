@@ -30,12 +30,7 @@ on:
         description: 启用SUSFS
         required: true
         type: boolean
-        default: true
-      anykernel3:
-        description: 打包AnyKernel3
-        required: true
-        type: boolean
-        default: true
+        default: false
 
 env:
   LLVM: 1
@@ -204,48 +199,27 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: Package AnyKernel3
-        if: inputs.anykernel3
+      - name: Package AnyKernel3 Zip
         run: |
-          echo "::group::Package AnyKernel3"
-          cd ${{ github.workspace }}
-
-          if [ ! -d "AnyKernel3" ]; then
-            git clone https://github.com/osm0sis/AnyKernel3.git
+          echo "::group::Package AnyKernel3 Zip"
+          git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+          # Copy Image from normal build locations
+          if [ -f "$GITHUB_WORKSPACE/kernel/out/arch/arm64/Image" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/Image" "$GITHUB_WORKSPACE/AnyKernel3/Image"
+          else
+            echo "Error: Image file not found in any expected location"
+            exit 1
           fi
-
-          cp sm8550/out/arch/arm64/boot/Image AnyKernel3/
-
-          KSU_SUFFIX=""
-          if [ "${{ inputs.ksu_type }}" != "None" ]; then
-            KSU_SUFFIX="-${{ inputs.ksu_type }}"
-          fi
-
-          if [ "${{ inputs.susfs }}" = "true" ]; then
-            KSU_SUFFIX="${KSU_SUFFIX}-SUSFS"
-          fi
-
-          ZIPNAME="AnyKernel3-sm8550${KSU_SUFFIX}-$(date +%Y%m%d).zip"
-
-          cd AnyKernel3
-          zip -r9 ../${ZIPNAME} ./
-
-          mkdir -p ../out
-          mv ../${ZIPNAME} ../out/
-
-          echo "::notice::Package created: out/${ZIPNAME}"
-          ls -lh ../out/${ZIPNAME}
           echo "::endgroup::"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}
-          path: |
-            sm8550/out/arch/arm64/boot/Image
-            out/*.zip
-            sm8550/build.log
-          retention-days: 7
+          name: ${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}-AnyKernel3
+          path: ${{ github.workspace }}/AnyKernel3/**
+          if-no-files-found: ignore
+          compression-level: 9
 
       - name: Show ccache stats
         run: |
