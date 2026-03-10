@@ -48,9 +48,11 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 1024
+          root-reserve-mb: 2048
           swap-size-mb: 16384
           remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -67,6 +69,16 @@ jobs:
         with:
           packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3 git ccache patch unzip
           version: 1.0
+
+      - name: Cache LLVM
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/llvm
+          key: llvm-21.1-${{ runner.os }}
+          restore-keys: |
+            llvm-21.1-${{ runner.os }}
+            llvm-21-
 
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v2
