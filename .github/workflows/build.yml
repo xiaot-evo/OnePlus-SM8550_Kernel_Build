@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get build info
         id: build-info
@@ -62,7 +62,7 @@ jobs:
           echo "::notice::Build started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.ccache
           key: cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-${{ inputs.ksu_type }}-${{ hashFiles('.github/workflows/build.yml') }}
@@ -70,6 +70,11 @@ jobs:
             cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-${{ inputs.ksu_type }}-
             cckernel-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}-
             cckernel-${{ inputs.kernel_source }}-
+
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
 
       - name: Install build dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
