@@ -1,0 +1,27 @@
+# Build outputs
+sm8550/
+sm8550-modules/
+out/
+*.log
+
+# AnyKernel3
+AnyKernel3/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.bak
+*~
+
+# LLVM
+~/llvm/
+llvm/

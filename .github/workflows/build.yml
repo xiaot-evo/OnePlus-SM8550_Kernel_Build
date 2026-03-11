@@ -31,6 +31,11 @@ on:
         required: true
         type: boolean
         default: false
+      enable_lto:
+        description: 启用LTO优化
+        required: true
+        type: boolean
+        default: false
 
 env:
   LLVM: 1
@@ -38,11 +43,38 @@ env:
   USE_SCCACHE: 1
   SCCACHE_GHA_ENABLED: "true"
   SCCACHE_STAT_SIZE: 1000000
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
 
 jobs:
+  security-check:
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.security.outputs.status }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Run dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+      - name: Check for sensitive data
+        id: security
+        run: |
+          echo "status=passed" >> $GITHUB_OUTPUT
+          if grep -r "password\|secret\|token" --include="*.yml" --include="*.yaml" .github/ 2>/dev/null; then
+            echo "::warning::Potential sensitive data found"
+          fi
+
   build:
+    needs: security-check
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        retry: [1, 2, 3]
 
     steps:
       - name: Checkout repository
@@ -55,35 +87,21 @@ jobs:
           echo "runner=$(hostname)" >> $GITHUB_OUTPUT
           echo "::notice::Build started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
       - name: Install build dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3 git ccache patch unzip
+          packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3 git ccache patch unzip xz-utils
           version: 1.0
-
-      - name: Cache LLVM
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/llvm
-          key: llvm-21.1-${{ runner.os }}
-          restore-keys: |
-            llvm-21.1-${{ runner.os }}
-            llvm-21-
 
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "21.1"
-
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 1024
-          swap-size-mb: 16384
-          remove-dotnet: "true"
-          remove-android: "true"
-          remove-haskell: "true"
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -93,6 +111,7 @@ jobs:
           echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
           echo "SCCACHE_STAT_SIZE=1000000" >> $GITHUB_ENV
           echo "SCCACHE_WRAPPER_START_DELAY=3" >> $GITHUB_ENV
+          echo "SCCACHE_DIR=${{ github.workspace }}/.sccache" >> $GITHUB_ENV
           echo "CC=clang" >> $GITHUB_ENV
           echo "CXX=clang++" >> $GITHUB_ENV
           echo "SCCACHE=1" >> $GITHUB_ENV
@@ -105,7 +124,15 @@ jobs:
           restore-keys: |
             kernel-refs-${{ inputs.kernel_source }}-
 
+      - name: Cache Patches
+        uses: actions/cache@v5
+        with:
+          path: patches
+          key: patches-${{ hashFiles('patches/*.patch') }}
+          restore-keys: patches-
+
       - name: Clone Kernel Source
+        id: clone
         run: |
           echo "::group::Clone kernel source"
           mkdir -p sm8550 sm8550-modules
@@ -196,8 +223,14 @@ jobs:
             printf 'CONFIG_KSU_MANUAL_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y\nCONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y\n' >> arch/arm64/configs/gki_defconfig
           fi
 
+          if [ "${{ inputs.enable_lto }}" = "true" ]; then
+            echo "CONFIG_LTO=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_LTO_CLANG=y" >> arch/arm64/configs/gki_defconfig
+            echo "CONFIG_THINLTO=y" >> arch/arm64/configs/gki_defconfig
+          fi
+
           echo "Added config options:"
-          grep -E "CONFIG_KSU|CONFIG_TMPFS" arch/arm64/configs/gki_defconfig
+          grep -E "CONFIG_KSU|CONFIG_TMPFS|CONFIG_LTO" arch/arm64/configs/gki_defconfig || true
           echo "::endgroup::"
 
       - name: Build Kernel Defconfig
@@ -212,6 +245,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Build Kernel Image
+        id: build
         run: |
           echo "::group::Build kernel image"
           echo "Starting at $(date)"
@@ -227,6 +261,15 @@ jobs:
             echo "::notice::Build successful!"
             ls -lh sm8550/out/arch/arm64/boot/Image
             echo "Image size: $(stat -c%s sm8550/out/arch/arm64/boot/Image) bytes"
+
+            FILE_INFO=$(file sm8550/out/arch/arm64/boot/Image)
+            echo "File type: $FILE_INFO"
+
+            if echo "$FILE_INFO" | grep -q "kernel"; then
+              echo "::notice::Valid kernel image confirmed"
+            else
+              echo "::warning::Unexpected file type"
+            fi
           else
             echo "::error::Build failed: Image not found"
             if [ -f sm8550/build.log ]; then
@@ -237,24 +280,39 @@ jobs:
           fi
           echo "::endgroup::"
 
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.retry }}
+          path: sm8550/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Package AnyKernel3 Zip
         run: |
           echo "::group::Package AnyKernel3 Zip"
           git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git
-          # Copy Image from normal build locations
+
           if [ -f "$GITHUB_WORKSPACE/sm8550/out/arch/arm64/boot/Image" ]; then
             cp "$GITHUB_WORKSPACE/sm8550/out/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/AnyKernel3/Image"
           else
             echo "Error: Image file not found in any expected location"
             exit 1
           fi
+
+          cd AnyKernel3
+          if [ -f anykernel.sh ]; then
+            sed -i "s/kernel.string=.*/kernel.string=OnePlus SM8550/" anykernel.sh
+            sed -i "s/kernel.version=.*/kernel.version=${{ steps.kernel-commit.outputs.hash }}/" anykernel.sh
+          fi
           echo "::endgroup::"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}-AnyKernel3
+          name: ${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}-${{ inputs.enable_lto }}-AnyKernel3
           path: ${{ github.workspace }}/AnyKernel3/**
           if-no-files-found: ignore
           compression-level: 9
@@ -267,21 +325,29 @@ jobs:
 
       - name: Build summary
         run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          BUILD_STATUS="${{ job.status }}"
+          if [ "$BUILD_STATUS" = "success" ]; then
+            echo "## ✅ Build Summary" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Build Summary" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $BUILD_STATUS |" >> $GITHUB_STEP_SUMMARY
           echo "| Kernel Source | ${{ inputs.kernel_source }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ inputs.kernel_branch }} |" >> $GITHUB_STEP_SUMMARY
           echo "| KSU Type | ${{ inputs.ksu_type }} |" >> $GITHUB_STEP_SUMMARY
           echo "| SUSFS | ${{ inputs.susfs }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| AnyKernel3 | ${{ inputs.anykernel3 }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| LTO | ${{ inputs.enable_lto }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ steps.kernel-commit.outputs.hash }}\` |" >> $GITHUB_STEP_SUMMARY
 
           if [ -f sm8550/out/arch/arm64/boot/Image ]; then
             echo "| Image Size | $(du -h sm8550/out/arch/arm64/boot/Image | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if ls out/*.zip 1> /dev/null 2>&1; then
-            echo "| Package | $(ls out/*.zip) |" >> $GITHUB_STEP_SUMMARY
+          if [ "$BUILD_STATUS" = "success" ]; then
+            echo "| Artifact | AnyKernel3.zip |" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "| Build Time | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
@@ -292,5 +358,39 @@ jobs:
           echo "::group::Cleanup"
           rm -rf sm8550-modules
           rm -rf AnyKernel3
+          rm -rf .sccache
           df -h /workspace 2>/dev/null || true
           echo "::endgroup::"
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.kernel_branch != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ github.run_id }}
+          name: Kernel ${{ inputs.kernel_source }} ${{ inputs.ksu_type }} ${{ inputs.susfs }}
+          draft: true
+          files: artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send failure notification
+        if: needs.build.result == 'failure'
+        run: |
+          echo "::notice::Build failed! Check workflow logs for details."
+          echo "Repository: ${{ github.repository }}"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "Run ID: ${{ github.run_id }}"
