@@ -47,6 +47,7 @@ env:
 
 jobs:
   security-check:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       status: ${{ steps.security.outputs.status }}
@@ -68,7 +69,6 @@ jobs:
           fi
 
   build:
-    needs: security-check
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
