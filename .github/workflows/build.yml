@@ -1,0 +1,214 @@
+name: Build Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source:
+        description: 内核源码
+        required: true
+        type: choice
+        options:
+          - crdroidandroid
+          - LineageOS
+          - OnePlus12R-development
+      kernel_branch:
+        description: 内核源码分支
+        required: false
+        type: string
+        default: ""
+      ksu_type:
+        description: KSU管理器
+        required: true
+        type: choice
+        options:
+          - None
+          - KernelSU-Next
+          - KowSU
+          - ReSukiSU
+          - ReSukiSU-Manual
+      susfs:
+        description: 启用SUSFS
+        required: true
+        type: boolean
+        default: false
+      enable_lto:
+        description: 启用LTO优化
+        required: true
+        type: boolean
+        default: false
+
+env:
+  LLVM: 1
+  LLVM_IAS: 1
+  USE_SCCACHE: 1
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_STAT_SIZE: 1000000
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  KERNEL_DIR: "sm8550"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        retry: [1, 2, 3]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Install build dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: bc bison build-essential cpio curl dwarves flex libssl-dev libelf-dev libdw-dev lz4 python3 git ccache patch unzip xz-utils
+          version: 1.0
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "21.1"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure SCCACHE
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "SCCACHE_STAT_SIZE=1000000" >> $GITHUB_ENV
+          echo "SCCACHE_WRAPPER_START_DELAY=3" >> $GITHUB_ENV
+          echo "SCCACHE_DIR=${{ github.workspace }}/.sccache" >> $GITHUB_ENV
+
+      - name: Cache Git References
+        uses: actions/cache@v5
+        with:
+          path: ~/.kernel-refs
+          key: kernel-refs-${{ inputs.kernel_source }}-${{ inputs.kernel_branch }}
+
+      - name: Clone Kernel Source
+        run: |
+          mkdir -p $KERNEL_DIR
+          mkdir -p ~/.kernel-refs/${{ inputs.kernel_source }}
+          
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            --reference ~/.kernel-refs/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550 \
+            --dissociate \
+            "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git" $KERNEL_DIR || \
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            "https://github.com/${{ inputs.kernel_source }}/android_kernel_oneplus_sm8550.git" $KERNEL_DIR
+
+      - name: Setup KernelSU
+        env:
+          KSU_TYPE: ${{ inputs.ksu_type }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+          WORKSPACE: ${{ github.workspace }}
+        run: bash scripts/install_ksu.sh
+
+      - name: Setup SUSFS
+        env:
+          ENABLE_SUSFS: ${{ inputs.susfs }}
+          WORKSPACE: ${{ github.workspace }}
+          ANDROID_VERSION: "android13"
+          KERNEL_VERSION: "1.15"
+        run: bash scripts/install_susfs.sh
+
+      - name: Get Kernel Commit Info
+        id: kernel-commit
+        run: |
+          echo "hash=$(cd $KERNEL_DIR && git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Cache Build Output
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.KERNEL_DIR }}/out
+          key: kernel-out-${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}-${{ steps.kernel-commit.outputs.hash }}
+
+      - name: Configure Kernel
+        env:
+          KSU_TYPE: ${{ inputs.ksu_type }}
+          ENABLE_SUSFS: ${{ inputs.susfs }}
+          ENABLE_LTO: ${{ inputs.enable_lto }}
+          WORKSPACE: ${{ github.workspace }}
+        run: bash scripts/config_kernel.sh
+
+      - name: Build Kernel
+        env:
+          WORKSPACE: ${{ github.workspace }}
+        run: bash scripts/build.sh
+
+      - name: Validate Build Output
+        env:
+          WORKSPACE: ${{ github.workspace }}
+        run: bash scripts/validate_build.sh
+
+      - name: Package AnyKernel3 Zip
+        env:
+          WORKSPACE: ${{ github.workspace }}
+          KERNEL_COMMIT: ${{ steps.kernel-commit.outputs.hash }}
+        run: bash scripts/package.sh
+
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.retry }}
+          path: ${{ env.KERNEL_DIR }}/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ inputs.susfs }}-${{ inputs.enable_lto }}-AnyKernel3
+          path: ${{ github.workspace }}/AnyKernel3/**
+          if-no-files-found: ignore
+          compression-level: 9
+
+      - name: Show sccache stats
+        run: sccache --show-stats
+
+      - name: Generate Build Summary
+        run: |
+          BUILD_STATUS="${{ job.status }}"
+          if [ "$BUILD_STATUS" = "success" ]; then
+            echo "## ✅ Build Summary" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Build Summary" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $BUILD_STATUS |" >> $GITHUB_STEP_SUMMARY
+          echo "| Kernel Source | ${{ inputs.kernel_source }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ inputs.kernel_branch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| KSU Type | ${{ inputs.ksu_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SUSFS | ${{ inputs.susfs }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| LTO | ${{ inputs.enable_lto }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ steps.kernel-commit.outputs.hash }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Time | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.kernel_branch != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.kernel_source }}-${{ inputs.ksu_type }}-${{ github.run_id }}
+          name: Kernel ${{ inputs.kernel_source }} ${{ inputs.ksu_type }} ${{ inputs.susfs }}
+          draft: true
+          files: artifacts/**/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
